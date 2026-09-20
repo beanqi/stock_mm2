@@ -531,7 +531,7 @@ impl VenueApi for GateVenue {
                 symbol: symbol.clone(),
                 side: if size >= 0 { Side::Buy } else { Side::Sell },
                 purpose: String::new(),
-                px: Px(parse_dec(o["price"].as_str().unwrap_or("0"))?),
+                px: Px(o.get("price").and_then(json_dec).unwrap_or(Decimal::ZERO)),
                 qty: Qty(Decimal::from(size.abs())),
                 filled_qty: Qty(Decimal::from((size.abs() - left.abs()).max(0))),
                 status: o["status"].as_str().unwrap_or("open").into(),
@@ -637,13 +637,15 @@ fn map_result(coid: ClientOrderId, r: Result<()>) -> ReqOutcome {
 }
 
 fn json_dec(v: &Value) -> Option<Decimal> {
-    if let Some(s) = v.as_str() {
-        return parse_dec(s).ok();
+    match v {
+        Value::String(s) => parse_dec(s).ok(),
+        // Gate sends numbers as JSON numbers on the private stream and as strings over REST.
+        // serde_json holds them as f64, so round-trip through the shortest decimal form:
+        // `Decimal::from_f64_retain` would keep the binary error (1770.22 becomes
+        // 1770.2200000000000272848410527) and break tick-size and price comparisons.
+        Value::Number(n) => parse_dec(&n.to_string()).ok(),
+        _ => None,
     }
-    if let Some(n) = v.as_i64() {
-        return Some(Decimal::from(n));
-    }
-    v.as_f64().and_then(Decimal::from_f64_retain)
 }
 
 fn json_i64(v: &Value) -> Option<i64> {
@@ -772,27 +774,19 @@ fn parse_gate_order(o: &Value) -> Option<PrivateMsg> {
     }
     let size = o.get("size").and_then(json_i64).unwrap_or(0);
     let left = o.get("left").and_then(json_i64).unwrap_or(size);
+    let filled = (size.abs() - left.abs()).max(0);
     let status = o["status"].as_str().unwrap_or("");
     let finish = o["finish_as"].as_str().unwrap_or("");
-    let kind = match (status, finish) {
-        ("open", _) if left != size => ExecKind::PartialFill,
-        ("finished", "filled") => ExecKind::Fill,
-        ("finished", "cancelled") => ExecKind::Canceled,
-        ("finished", "ioc") | ("finished", "reduce_only") => {
-            if left == 0 {
-                ExecKind::Fill
-            } else if left != size {
-                ExecKind::PartialFill
-            } else {
-                ExecKind::Canceled
-            }
-        }
-        ("open", _) => ExecKind::Ack,
+    // A `finished` order is terminal whatever the reason, so it must never map to `Ack`:
+    // that would leave the strategy believing a dead order is still working.
+    let kind = match status {
+        "finished" if left == 0 || finish == "filled" => ExecKind::Fill,
+        "finished" => ExecKind::Canceled,
+        _ if filled > 0 => ExecKind::PartialFill,
         _ => ExecKind::Ack,
     };
     let text = o["text"].as_str().unwrap_or("");
     let coid = text.strip_prefix("t-").unwrap_or(text);
-    let filled = (size.abs() - left.abs()).max(0);
     Some(PrivateMsg::Exec(ExecReport {
         coid: ClientOrderId(coid.into()),
         exchange_id: o["id"].as_i64().map(|i| i.to_string()),
@@ -800,12 +794,20 @@ fn parse_gate_order(o: &Value) -> Option<PrivateMsg> {
         symbol: SymbolId::new(o["contract"].as_str().unwrap_or_default()),
         kind,
         side: if size >= 0 { Side::Buy } else { Side::Sell },
-        px: parse_dec(o["price"].as_str().unwrap_or("0")).ok().map(Px),
+        px: o
+            .get("price")
+            .and_then(json_dec)
+            .filter(|p| *p > Decimal::ZERO)
+            .map(Px),
         qty: Some(Qty(Decimal::from(size.abs()))),
         filled_qty: Qty(Decimal::from(filled)),
-        last_px: parse_dec(o["fill_price"].as_str().unwrap_or("0")).ok().map(Px),
+        last_px: o
+            .get("fill_price")
+            .and_then(json_dec)
+            .filter(|p| *p > Decimal::ZERO)
+            .map(Px),
         last_qty: None,
-        reason: None,
+        reason: (!finish.is_empty()).then(|| finish.to_string()),
         ts: Ts::now_system(),
     }))
 }
@@ -851,6 +853,55 @@ mod tests {
         assert!(is_single_position_mode(&json!({"in_dual_mode":false})));
         assert!(!is_single_position_mode(&json!({"in_dual_mode":true})));
         assert_eq!(current_position_mode(&json!({"position_mode":"dual"})), "dual");
+    }
+
+    /// The `futures.orders` push sends `price`/`fill_price` as JSON numbers while REST sends
+    /// strings; reading only the string form silently yielded a price of 0, which made the
+    /// strategy think every resting order was mispriced and requote it on every tick.
+    #[test]
+    fn parses_numeric_order_push_price() {
+        let raw = r#"{"channel":"futures.orders","event":"update","result":[{"contract":"SNDK_USDT","id":324822126929229396,"text":"t-s1-grid-sell-2-9","size":-1,"left":-1,"status":"open","price":1770.22,"fill_price":0,"tif":"poc"}]}"#;
+        let msgs = parse_private(raw);
+        assert_eq!(msgs.len(), 1);
+        let PrivateMsg::Exec(e) = &msgs[0] else {
+            panic!("expected exec, got {:?}", msgs[0]);
+        };
+        assert_eq!(e.coid.as_str(), "s1-grid-sell-2-9");
+        assert_eq!(e.kind, ExecKind::Ack);
+        assert_eq!(e.side, Side::Sell);
+        assert_eq!(e.px.unwrap().0.to_string(), "1770.22");
+        assert!(e.last_px.is_none(), "unfilled order has no fill price");
+    }
+
+    #[test]
+    fn json_numbers_keep_exact_decimals() {
+        assert_eq!(json_dec(&json!(1770.22)).unwrap().to_string(), "1770.22");
+        assert_eq!(json_dec(&json!("1770.22")).unwrap().to_string(), "1770.22");
+        assert_eq!(json_dec(&json!(-3)).unwrap().to_string(), "-3");
+        assert!(json_dec(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn finished_order_is_never_live() {
+        let raw = r#"{"channel":"futures.orders","event":"update","result":{"contract":"SNDK_USDT","id":1,"text":"t-s1-grid-buy-0-1","size":2,"left":2,"status":"finished","finish_as":"poc","price":1762.5}}"#;
+        let msgs = parse_private(raw);
+        let PrivateMsg::Exec(e) = &msgs[0] else {
+            panic!("expected exec");
+        };
+        assert_eq!(e.kind, ExecKind::Canceled);
+        assert_eq!(e.reason.as_deref(), Some("poc"));
+    }
+
+    #[test]
+    fn partial_fill_reports_cumulative_filled() {
+        let raw = r#"{"channel":"futures.orders","event":"update","result":{"contract":"SNDK_USDT","id":1,"text":"t-s1-grid-sell-0-1","size":-5,"left":-2,"status":"open","price":1770.5,"fill_price":1770.5}}"#;
+        let msgs = parse_private(raw);
+        let PrivateMsg::Exec(e) = &msgs[0] else {
+            panic!("expected exec");
+        };
+        assert_eq!(e.kind, ExecKind::PartialFill);
+        assert_eq!(e.filled_qty.0, Decimal::from(3));
+        assert_eq!(e.last_px.unwrap().0.to_string(), "1770.5");
     }
 
     #[test]

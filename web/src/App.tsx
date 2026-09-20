@@ -5,7 +5,7 @@ import Login from "./pages/Login";
 import Strategies from "./pages/Strategies";
 import StrategyForm from "./pages/StrategyForm";
 import StrategyDetail from "./pages/StrategyDetail";
-import Orders from "./pages/Orders";
+import Fills from "./pages/Fills";
 
 export default function App() {
   return (
@@ -91,7 +91,6 @@ function Shell() {
             策略
           </NavLink>
           <NavLink to="/new">新建</NavLink>
-          <NavLink to="/orders">订单</NavLink>
           <NavLink to="/fills">成交</NavLink>
         </nav>
         <div className="spacer" />
@@ -140,8 +139,7 @@ function Shell() {
           <Route path="/new" element={<StrategyForm />} />
           <Route path="/strategies/:id" element={<StrategyDetail live={snaps} />} />
           <Route path="/strategies/:id/edit" element={<StrategyForm />} />
-          <Route path="/orders" element={<Orders kind="orders" />} />
-          <Route path="/fills" element={<Orders kind="fills" />} />
+          <Route path="/fills" element={<Fills />} />
         </Routes>
       </main>
     </div>

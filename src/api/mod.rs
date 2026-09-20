@@ -52,7 +52,6 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         .route("/api/strategies/{id}/start", post(start_strategy))
         .route("/api/strategies/{id}/stop", post(stop_strategy))
         .route("/api/strategies/{id}/flatten", post(flatten_strategy))
-        .route("/api/orders", get(list_orders))
         .route("/api/fills", get(list_fills))
         .route("/api/positions", get(list_positions))
         .route("/api/journal", get(list_journal))
@@ -285,24 +284,7 @@ async fn flatten_strategy(State(st): State<AppState>, Path(id): Path<String>) ->
 #[derive(Deserialize)]
 struct ListQuery {
     strategy_id: Option<String>,
-    open: Option<bool>,
     limit: Option<i64>,
-}
-
-async fn list_orders(State(st): State<AppState>, Query(q): Query<ListQuery>) -> Response {
-    match st
-        .engine
-        .store
-        .list_orders(
-            q.strategy_id.as_deref(),
-            q.open.unwrap_or(false),
-            q.limit.unwrap_or(200),
-        )
-        .await
-    {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(e),
-    }
 }
 
 async fn list_fills(State(st): State<AppState>, Query(q): Query<ListQuery>) -> Response {

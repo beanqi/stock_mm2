@@ -14,6 +14,9 @@ use super::quote::{
 use super::risk::{self, float_loss};
 use super::state::CoreState;
 
+/// How long a place/amend/cancel may stay unacknowledged before we stop assuming it is in flight.
+const PENDING_TIMEOUT_MS: i64 = 10_000;
+
 pub trait StrategyCoreApi {
     fn on_event(&mut self, now: Ts, ev: &Event, out: &mut Vec<Action>);
     fn snapshot(&self) -> StateSnapshot;
@@ -49,6 +52,7 @@ impl StrategyCoreApi for StrategyCore {
         {
             return;
         }
+        self.expire_pending(now);
         self.reprice(now);
         self.advance_exits(now, out);
         self.state.permission = risk::evaluate(&self.cfg, &self.state, &self.maker, now);
@@ -145,6 +149,45 @@ impl StrategyCore {
         }
     }
 
+    /// Reconcile the slot map against the venue's authoritative open-order list.
+    ///
+    /// Resolves `Unknown` slots, and returns the client order ids that carry our strategy
+    /// prefix but belong to no slot. Those are unreachable by `reconcile`, so without this
+    /// sweep they would rest on the book forever, tying up margin.
+    pub fn reconcile_open_orders(
+        &mut self,
+        open: &[crate::types::ClientOrderId],
+    ) -> Vec<crate::types::ClientOrderId> {
+        let keys: Vec<SlotKey> = self.state.slots.keys().copied().collect();
+        for key in keys {
+            let slot = self.state.slot(key);
+            if slot.state != SlotStateKind::Unknown {
+                continue;
+            }
+            let found = slot.live.as_ref().is_some_and(|l| open.contains(&l.coid));
+            if found {
+                slot.state = SlotStateKind::Live;
+                slot.pending_since = None;
+                slot.note_accepted();
+            } else {
+                slot.state = SlotStateKind::Empty;
+                slot.live = None;
+                slot.pending_since = None;
+            }
+        }
+        let tracked: std::collections::HashSet<&str> = self
+            .state
+            .slots
+            .values()
+            .filter_map(|s| s.live.as_ref().map(|l| l.coid.as_str()))
+            .collect();
+        open.iter()
+            .filter(|c| c.strategy_prefix() == Some(self.cfg.id.as_str()))
+            .filter(|c| !tracked.contains(c.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub fn set_md_link(&mut self, is_ref: bool, up: bool) {
         if is_ref {
             self.state.links.ref_md = up;
@@ -182,6 +225,7 @@ impl StrategyCore {
         now: Ts,
         coid: &crate::types::ClientOrderId,
         result: ReqResult,
+        // Rejection reasons are logged by the caller, which also sees untracked order ids.
         _reason: Option<&str>,
     ) {
         let Some(key) = self.state.find_slot_by_coid(coid) else {
@@ -189,15 +233,36 @@ impl StrategyCore {
         };
         let slot = self.state.slot(key);
         match result {
-            ReqResult::Accepted => {}
+            ReqResult::Accepted => slot.note_accepted(),
             ReqResult::Rejected => {
-                if matches!(
-                    slot.state,
-                    SlotStateKind::PendingNew | SlotStateKind::PendingAmend
-                ) {
-                    slot.state = SlotStateKind::Empty;
-                    slot.live = None;
-                    slot.pending_since = None;
+                slot.note_reject(now);
+                match slot.state {
+                    // The venue refused to create the order, so there is nothing resting.
+                    SlotStateKind::PendingNew => {
+                        slot.state = SlotStateKind::Empty;
+                        slot.live = None;
+                        slot.pending_since = None;
+                    }
+                    // A refused amend leaves the original order working; forgetting it here
+                    // would orphan it on the book with nothing left to cancel it.
+                    SlotStateKind::PendingAmend => {
+                        if let (Some((px, qty)), Some(l)) =
+                            (slot.amend_from.take(), slot.live.as_mut())
+                        {
+                            l.px = px;
+                            l.qty = qty;
+                        }
+                        slot.state = SlotStateKind::Live;
+                        slot.pending_since = None;
+                    }
+                    // A refused cancel almost always means the order is already gone. If it
+                    // isn't, the open-order sweep will find it and cancel it again.
+                    SlotStateKind::PendingCancel => {
+                        slot.state = SlotStateKind::Empty;
+                        slot.live = None;
+                        slot.pending_since = None;
+                    }
+                    _ => {}
                 }
             }
             ReqResult::Unknown => {
@@ -216,20 +281,35 @@ impl StrategyCore {
                 let slot = self.state.slot(key);
                 slot.state = SlotStateKind::Live;
                 slot.pending_since = None;
+                slot.amend_from = None;
+                slot.note_accepted();
                 if let Some(live) = slot.live.as_mut() {
-                    if let Some(px) = rep.px {
+                    // Only trust positive values: a venue that omits or zeroes these would
+                    // otherwise make the order look infinitely mispriced and requote forever.
+                    if let Some(px) = rep.px.filter(|p| p.is_positive()) {
                         live.px = px;
                     }
-                    if let Some(qty) = rep.qty {
+                    if let Some(qty) = rep.qty.filter(|q| q.is_positive()) {
                         live.qty = qty;
                     }
                     live.exchange_id = rep.exchange_id.clone();
                 }
             }
-            ExecKind::Reject | ExecKind::AmendReject => {
+            ExecKind::Reject => {
                 let slot = self.state.slot(key);
+                slot.note_reject(now);
                 slot.state = SlotStateKind::Empty;
                 slot.live = None;
+                slot.pending_since = None;
+            }
+            ExecKind::AmendReject => {
+                let slot = self.state.slot(key);
+                slot.note_reject(now);
+                if let (Some((px, qty)), Some(l)) = (slot.amend_from.take(), slot.live.as_mut()) {
+                    l.px = px;
+                    l.qty = qty;
+                }
+                slot.state = SlotStateKind::Live;
                 slot.pending_since = None;
             }
             ExecKind::Canceled | ExecKind::Expired => {
@@ -315,6 +395,30 @@ impl StrategyCore {
             fast_deadline: now,
             force_deadline: now.saturating_add_millis(self.cfg.exit.force_exit_timeout_ms as i64),
         });
+    }
+
+    /// A request whose acknowledgement never arrives used to leave the slot pending forever,
+    /// silently retiring that grid level for the rest of the process. Park it as `Unknown`
+    /// instead: quoting drops to reduce-only until the open-order sweep says what is real.
+    fn expire_pending(&mut self, now: Ts) {
+        for (key, slot) in self.state.slots.iter_mut() {
+            if !matches!(
+                slot.state,
+                SlotStateKind::PendingNew
+                    | SlotStateKind::PendingAmend
+                    | SlotStateKind::PendingCancel
+            ) {
+                continue;
+            }
+            let stale = slot
+                .pending_since
+                .is_some_and(|t| now.duration_since_ms(t) > PENDING_TIMEOUT_MS);
+            if stale {
+                tracing::warn!(slot = %key, state = ?slot.state, "request timed out; slot unknown");
+                slot.state = SlotStateKind::Unknown;
+                slot.pending_since = Some(now);
+            }
+        }
     }
 
     fn reprice(&mut self, now: Ts) {
@@ -833,6 +937,193 @@ mod tests {
             out.iter()
                 .any(|a| matches!(a, Action::CancelAll { .. })),
             "jump should cancel all {out:?}"
+        );
+    }
+
+    /// A venue that refuses a placement (no margin, bad price) must not be hammered on every
+    /// book tick: that is what turned one blocked grid level into ~100k orders in 15 minutes.
+    #[test]
+    fn rejected_place_backs_off() {
+        let mut core = StrategyCore::new(StrategyConfig::default(), inst());
+        let t0 = Ts::from_millis(1_000_000);
+        let _ = drive_warmup(&mut core, t0);
+        let (key, coid) = core
+            .state
+            .slots
+            .iter()
+            .find(|(k, s)| k.side == Side::Sell && s.live.is_some())
+            .map(|(k, s)| (*k, s.live.as_ref().unwrap().coid.clone()))
+            .expect("sell slot");
+        let ts = t0.saturating_add_millis(5_000);
+        let mut out = Vec::new();
+        core.on_event(
+            ts,
+            &Event::ReqOutcome {
+                coid,
+                result: ReqResult::Rejected,
+                reason: Some("BALANCE_NOT_ENOUGH".into()),
+            },
+            &mut out,
+        );
+        assert_eq!(core.state.slot(key).state, SlotStateKind::Empty);
+
+        let mut places = 0;
+        for i in 1..=8 {
+            let t = ts.saturating_add_millis(i * 25);
+            let mut out = Vec::new();
+            core.on_event(t, &Event::MakerBook(book(VenueId::Gate, dec!(100.10), t)), &mut out);
+            places += out
+                .iter()
+                .filter(|a| matches!(a, Action::Place(p) if p.side == Side::Sell))
+                .count();
+        }
+        assert_eq!(places, 0, "backoff should hold the slot for 250ms");
+
+        let t = ts.saturating_add_millis(400);
+        let mut out = Vec::new();
+        core.on_event(t, &Event::MakerBook(book(VenueId::Gate, dec!(100.10), t)), &mut out);
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Place(p) if p.side == Side::Sell)),
+            "slot should retry once the backoff expires {out:?}"
+        );
+    }
+
+    /// A refused amend leaves the original order working on the venue. Dropping it from the
+    /// slot map stranded it there with nothing left able to cancel it.
+    #[test]
+    fn rejected_amend_keeps_the_live_order() {
+        let mut core = StrategyCore::new(StrategyConfig::default(), inst());
+        let t0 = Ts::from_millis(1_000_000);
+        let _ = drive_warmup(&mut core, t0);
+        let (key, live) = core
+            .state
+            .slots
+            .iter()
+            .find(|(k, s)| k.side == Side::Buy && s.live.is_some())
+            .map(|(k, s)| (*k, s.live.as_ref().unwrap().clone()))
+            .expect("buy slot");
+        let ts = t0.saturating_add_millis(5_000);
+        ack(&mut core, &live.coid, ts, Side::Buy, live.px, live.qty);
+        assert_eq!(core.state.slot(key).state, SlotStateKind::Live);
+
+        // Enough of a reference move to force a requote (>5bps) but below the 40bps jump guard.
+        let ts2 = ts.saturating_add_millis(100);
+        let mut out = Vec::new();
+        core.on_event(
+            ts2,
+            &Event::RefBook(book(VenueId::Binance, dec!(100.20), ts2)),
+            &mut out,
+        );
+        let amended = out.iter().any(|a| matches!(a, Action::Amend { coid, .. } if *coid == live.coid));
+        assert!(amended, "expected amend {out:?}");
+        assert_eq!(core.state.slot(key).state, SlotStateKind::PendingAmend);
+
+        let mut out = Vec::new();
+        core.on_event(
+            ts2.saturating_add_millis(10),
+            &Event::ReqOutcome {
+                coid: live.coid.clone(),
+                result: ReqResult::Rejected,
+                reason: Some("ORDER_NOT_FOUND".into()),
+            },
+            &mut out,
+        );
+        let slot = core.state.slot(key);
+        assert_eq!(slot.state, SlotStateKind::Live, "order is still on the venue");
+        let still = slot.live.as_ref().expect("live order retained");
+        assert_eq!(still.coid, live.coid);
+        assert_eq!(still.px, live.px, "optimistic amend price rolled back");
+    }
+
+    /// Anything the venue reports that no slot points at can only be cleaned up here.
+    #[test]
+    fn sweep_reports_untracked_own_orders() {
+        let mut core = StrategyCore::new(StrategyConfig::default(), inst());
+        let t0 = Ts::from_millis(1_000_000);
+        let _ = drive_warmup(&mut core, t0);
+        let tracked = core
+            .state
+            .slots
+            .values()
+            .filter_map(|s| s.live.as_ref().map(|l| l.coid.clone()))
+            .next()
+            .expect("a live order");
+        let orphan = crate::types::ClientOrderId("demo-grid-sell-0-999".into());
+        let foreign = crate::types::ClientOrderId("other-grid-sell-0-1".into());
+        let out = core.reconcile_open_orders(&[tracked, orphan.clone(), foreign]);
+        assert_eq!(out, vec![orphan], "only our own untracked orders");
+    }
+
+    #[test]
+    fn unknown_slot_resolves_from_open_orders() {
+        let mut core = StrategyCore::new(StrategyConfig::default(), inst());
+        let t0 = Ts::from_millis(1_000_000);
+        let _ = drive_warmup(&mut core, t0);
+        let (key, coid) = core
+            .state
+            .slots
+            .iter()
+            .find_map(|(k, s)| s.live.as_ref().map(|l| (*k, l.coid.clone())))
+            .unwrap();
+        core.state.slot(key).state = SlotStateKind::Unknown;
+        core.reconcile_open_orders(std::slice::from_ref(&coid));
+        assert_eq!(core.state.slot(key).state, SlotStateKind::Live);
+
+        core.state.slot(key).state = SlotStateKind::Unknown;
+        core.reconcile_open_orders(&[]);
+        assert_eq!(core.state.slot(key).state, SlotStateKind::Empty);
+        assert!(core.state.slot(key).live.is_none());
+    }
+
+    /// An acknowledgement carrying no usable price must not overwrite what we know, or the
+    /// order looks 100% mispriced and gets requoted on every single event.
+    #[test]
+    fn ack_without_price_keeps_known_price() {
+        let mut core = StrategyCore::new(StrategyConfig::default(), inst());
+        let t0 = Ts::from_millis(1_000_000);
+        let _ = drive_warmup(&mut core, t0);
+        let (key, live) = core
+            .state
+            .slots
+            .iter()
+            .find_map(|(k, s)| s.live.as_ref().map(|l| (*k, l.clone())))
+            .unwrap();
+        let ts = t0.saturating_add_millis(5_000);
+        ack(&mut core, &live.coid, ts, key.side, Px::default(), Qty::default());
+        let slot = core.state.slot(key);
+        assert_eq!(slot.state, SlotStateKind::Live);
+        assert_eq!(slot.live.as_ref().unwrap().px, live.px);
+        assert_eq!(slot.live.as_ref().unwrap().qty, live.qty);
+    }
+
+    fn ack(
+        core: &mut StrategyCore,
+        coid: &crate::types::ClientOrderId,
+        ts: Ts,
+        side: Side,
+        px: Px,
+        qty: Qty,
+    ) {
+        let mut out = Vec::new();
+        core.on_event(
+            ts,
+            &Event::Exec(ExecReport {
+                coid: coid.clone(),
+                exchange_id: Some("1".into()),
+                venue: VenueId::Gate,
+                symbol: SymbolId::new("AAPLUSDT"),
+                kind: ExecKind::Ack,
+                side,
+                px: Some(px),
+                qty: Some(qty),
+                filled_qty: Qty::default(),
+                last_px: None,
+                last_qty: None,
+                reason: None,
+                ts,
+            }),
+            &mut out,
         );
     }
 

@@ -5,9 +5,7 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 use crate::config::StrategyConfig;
-use crate::types::{
-    ClientOrderId, FillRecord, OrderRecord, Px, Qty, Side, StrategyId, SymbolId, Ts,
-};
+use crate::types::{ClientOrderId, FillRecord, Px, Qty, Side, StrategyId, SymbolId, Ts};
 
 #[derive(Clone)]
 pub struct Store {
@@ -51,22 +49,6 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS orders (
-                coid TEXT PRIMARY KEY,
-                strategy_id TEXT NOT NULL,
-                venue TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                purpose TEXT NOT NULL,
-                px TEXT NOT NULL,
-                qty TEXT NOT NULL,
-                filled_qty TEXT NOT NULL,
-                status TEXT NOT NULL,
-                exchange_id TEXT,
-                reduce_only INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy_id TEXT NOT NULL,
@@ -92,9 +74,9 @@ impl Store {
                 avg_px TEXT,
                 updated_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_orders_strategy ON orders(strategy_id, status);
             CREATE INDEX IF NOT EXISTS idx_fills_strategy ON fills(strategy_id, ts);
             CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(ts);
+            DROP TABLE IF EXISTS orders;
             "#,
         )
         .execute(&self.pool)
@@ -162,65 +144,6 @@ impl Store {
             out.push(serde_json::from_str(&json)?);
         }
         Ok(out)
-    }
-
-    pub async fn upsert_order(&self, rec: &OrderRecord) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO orders (
-                coid, strategy_id, venue, symbol, side, purpose, px, qty, filled_qty,
-                status, exchange_id, reduce_only, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(coid) DO UPDATE SET
-                px=excluded.px,
-                qty=excluded.qty,
-                filled_qty=excluded.filled_qty,
-                status=excluded.status,
-                exchange_id=excluded.exchange_id,
-                updated_at=excluded.updated_at
-            "#,
-        )
-        .bind(rec.coid.as_str())
-        .bind(&rec.strategy_id)
-        .bind(rec.venue.as_str())
-        .bind(rec.symbol.as_str())
-        .bind(rec.side.as_str())
-        .bind(&rec.purpose)
-        .bind(rec.px.0.to_string())
-        .bind(rec.qty.0.to_string())
-        .bind(rec.filled_qty.0.to_string())
-        .bind(&rec.status)
-        .bind(&rec.exchange_id)
-        .bind(if rec.reduce_only { 1 } else { 0 })
-        .bind(rec.created_at.millis())
-        .bind(rec.updated_at.millis())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_orders(
-        &self,
-        strategy_id: Option<&str>,
-        open_only: bool,
-        limit: i64,
-    ) -> Result<Vec<OrderRecord>> {
-        let sql = if strategy_id.is_some() && open_only {
-            "SELECT * FROM orders WHERE strategy_id = ? AND status NOT IN ('filled','canceled','rejected','expired') ORDER BY updated_at DESC LIMIT ?"
-        } else if strategy_id.is_some() {
-            "SELECT * FROM orders WHERE strategy_id = ? ORDER BY updated_at DESC LIMIT ?"
-        } else if open_only {
-            "SELECT * FROM orders WHERE status NOT IN ('filled','canceled','rejected','expired') ORDER BY updated_at DESC LIMIT ?"
-        } else {
-            "SELECT * FROM orders ORDER BY updated_at DESC LIMIT ?"
-        };
-        let mut q = sqlx::query(sql);
-        if let Some(id) = strategy_id {
-            q = q.bind(id);
-        }
-        q = q.bind(limit);
-        let rows = q.fetch_all(&self.pool).await?;
-        rows.into_iter().map(row_to_order).collect()
     }
 
     pub async fn insert_fill(&self, fill: &FillRecord) -> Result<i64> {
@@ -377,28 +300,6 @@ fn parse_qty(s: &str) -> Result<Qty> {
     Ok(Qty(s.parse::<Decimal>()?))
 }
 
-fn row_to_order(r: sqlx::sqlite::SqliteRow) -> Result<OrderRecord> {
-    Ok(OrderRecord {
-        coid: ClientOrderId(r.try_get("coid")?),
-        strategy_id: r.try_get("strategy_id")?,
-        venue: r.try_get::<String, _>("venue")?.parse().map_err(anyhow::Error::msg)?,
-        symbol: SymbolId::new(r.try_get::<String, _>("symbol")?),
-        side: match r.try_get::<String, _>("side")?.as_str() {
-            "sell" => Side::Sell,
-            _ => Side::Buy,
-        },
-        purpose: r.try_get("purpose")?,
-        px: parse_px(&r.try_get::<String, _>("px")?)?,
-        qty: parse_qty(&r.try_get::<String, _>("qty")?)?,
-        filled_qty: parse_qty(&r.try_get::<String, _>("filled_qty")?)?,
-        status: r.try_get("status")?,
-        exchange_id: r.try_get("exchange_id")?,
-        reduce_only: r.try_get::<i64, _>("reduce_only")? != 0,
-        created_at: Ts::from_millis(r.try_get("created_at")?),
-        updated_at: Ts::from_millis(r.try_get("updated_at")?),
-    })
-}
-
 fn row_to_fill(r: sqlx::sqlite::SqliteRow) -> Result<FillRecord> {
     Ok(FillRecord {
         id: r.try_get("id")?,
@@ -438,5 +339,27 @@ mod tests {
         store.delete_strategy(&cfg.id).await.unwrap();
         assert!(store.get_strategy(&cfg.id).await.unwrap().is_none());
         let _ = std::fs::remove_file(dir);
+    }
+
+    /// Order lifecycle rows are no longer kept, so an existing database must shed the table.
+    #[tokio::test]
+    async fn migration_drops_legacy_orders_table() {
+        let path = std::env::temp_dir().join(format!("mm-test-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.display());
+        let store = Store::open(&url).await.unwrap();
+        sqlx::query("CREATE TABLE orders (coid TEXT PRIMARY KEY)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&url).await.unwrap();
+        let found: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'orders'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(found, 0);
+        let _ = std::fs::remove_file(path);
     }
 }

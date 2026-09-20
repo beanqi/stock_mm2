@@ -94,19 +94,6 @@ export interface Instrument {
   volume_24h: string;
 }
 
-export interface Order {
-  coid: string;
-  strategy_id: string;
-  venue: Venue;
-  symbol: string;
-  side: string;
-  purpose: string;
-  px: string;
-  qty: string;
-  filled_qty: string;
-  status: string;
-}
-
 export interface Fill {
   id: number;
   strategy_id: string;
@@ -241,8 +228,6 @@ export const api = {
   flatten: (id: string) => req<void>("/api/strategies/" + id + "/flatten", { method: "POST" }),
   venues: () => req<VenueHealth[]>("/api/venues"),
   instruments: () => req<Instrument[]>("/api/instruments"),
-  orders: (strategyId?: string) =>
-    req<Order[]>("/api/orders" + (strategyId ? `?strategy_id=${strategyId}` : "")),
   fills: (strategyId?: string) =>
     req<Fill[]>("/api/fills" + (strategyId ? `?strategy_id=${strategyId}` : "")),
   risk: () => req<RiskView>("/api/risk"),

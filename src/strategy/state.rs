@@ -15,6 +15,13 @@ pub struct Slot {
     pub live: Option<LiveOrder>,
     pub desired: Option<DesiredOrder>,
     pub pending_since: Option<Ts>,
+    /// Price/qty the venue last confirmed, so a rejected amend can be rolled back instead of
+    /// discarding an order that is still working.
+    pub amend_from: Option<(Px, Qty)>,
+    /// Consecutive venue rejections, drives the backoff below.
+    pub reject_streak: u32,
+    /// No place or amend for this slot before this instant.
+    pub blocked_until: Option<Ts>,
 }
 
 impl Slot {
@@ -24,7 +31,27 @@ impl Slot {
             live: None,
             desired: None,
             pending_since: None,
+            amend_from: None,
+            reject_streak: 0,
+            blocked_until: None,
         }
+    }
+
+    pub fn is_blocked(&self, now: Ts) -> bool {
+        self.blocked_until.is_some_and(|t| now < t)
+    }
+
+    /// A venue that keeps refusing us (no margin, bad price, rate limit) must not be retried on
+    /// every book tick. Backs off 250ms, 500ms, 1s ... up to 8s, reset by the next acceptance.
+    pub fn note_reject(&mut self, now: Ts) {
+        self.reject_streak = self.reject_streak.saturating_add(1);
+        let shift = (self.reject_streak - 1).min(5);
+        self.blocked_until = Some(now.saturating_add_millis(250i64 << shift));
+    }
+
+    pub fn note_accepted(&mut self) {
+        self.reject_streak = 0;
+        self.blocked_until = None;
     }
 }
 

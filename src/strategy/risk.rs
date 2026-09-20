@@ -3,8 +3,7 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::config::StrategyConfig;
 use crate::types::{
-    Instrument, InstrumentStatus, LinkStatus, Px, Qty, QuotePermission, SlotStateKind,
-    TopOfBook, Ts,
+    Instrument, InstrumentStatus, LinkStatus, Px, QuotePermission, SlotStateKind, TopOfBook, Ts,
 };
 
 use super::state::CoreState;
@@ -173,7 +172,7 @@ mod tests {
     use super::*;
     use crate::config::StrategyConfig;
     use crate::types::{
-        BookUpdate, ContractKind, InstrumentStatus, Side, SymbolId, TopOfBook, VenueId,
+        BookUpdate, ContractKind, InstrumentStatus, Qty, Side, SymbolId, TopOfBook, VenueId,
     };
     use rust_decimal_macros::dec;
 

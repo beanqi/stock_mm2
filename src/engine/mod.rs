@@ -15,9 +15,8 @@ use crate::risk::GlobalRisk;
 use crate::store::Store;
 use crate::strategy::{StrategyCore, StrategyCoreApi};
 use crate::types::{
-    Action, BookUpdate, ControlCmd, Event, FillRecord, Instrument, LinkKind, OrderRecord, Qty,
-    RunMode, StateSnapshot, StrategyId, StrategyMode, SymbolId, TelemetryEvent, TimerId, Ts,
-    VenueId,
+    Action, BookUpdate, ControlCmd, Event, FillRecord, Instrument, LinkKind, Qty, RunMode,
+    StateSnapshot, StrategyId, StrategyMode, SymbolId, TelemetryEvent, TimerId, Ts, VenueId,
 };
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -489,6 +488,7 @@ async fn run_actor(
 
     let mut core = StrategyCore::new(cfg.clone(), inst);
     let mut out = Vec::new();
+    let mut fills = FillTracker::default();
     apply_venue_links(&mut core, &engine);
 
     if let Some(api) = engine.apis.get(&maker_venue) {
@@ -500,22 +500,8 @@ async fn run_actor(
                 }
             }
         }
-        if let Ok(orders) = api.open_orders(&maker_sym).await {
-            for o in orders {
-                if o.coid.strategy_prefix() != Some(sid.as_str()) {
-                    if live {
-                        if let Some(tx) = engine.trade.get(&maker_venue) {
-                            let _ = tx.send(Action::Cancel {
-                                coid: o.coid,
-                                venue: maker_venue,
-                                symbol: maker_sym.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
     }
+    sweep_open_orders(&engine, &mut core, live).await;
 
     dispatch(
         &mut core,
@@ -531,6 +517,8 @@ async fn run_actor(
     let mut priv_r = engine.private[&maker_venue].subscribe();
     let mut out_r = engine.outcomes[&maker_venue].subscribe();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(20));
+    sweep.reset();
 
     info!(strategy = %sid, "actor started");
     loop {
@@ -562,8 +550,19 @@ async fn run_actor(
             }
             Ok(msg) = priv_r.recv() => {
                 match msg {
-                    PrivateMsg::Exec(e) => {
-                        persist_exec(&engine, &sid, &e).await;
+                    PrivateMsg::Exec(mut e) => {
+                        // The private stream is shared by every strategy on the venue, so only
+                        // take events for our own symbol and our own client order ids.
+                        if e.symbol != maker_sym
+                            || e.coid.strategy_prefix() != Some(sid.as_str())
+                        {
+                            continue;
+                        }
+                        let inc = fills.increment(&e);
+                        if inc.is_positive() {
+                            e.last_qty = Some(inc);
+                        }
+                        persist_fill(&engine, &sid, &e).await;
                         dispatch(&mut core, Event::Exec(e), &engine, live, &mut out).await;
                     }
                     PrivateMsg::Position(p) => {
@@ -577,6 +576,18 @@ async fn run_actor(
                 }
             }
             Ok(oc) = out_r.recv() => {
+                if oc.coid.strategy_prefix() != Some(sid.as_str()) {
+                    continue;
+                }
+                if oc.result != crate::types::ReqResult::Accepted {
+                    warn!(
+                        strategy = %sid,
+                        coid = %oc.coid,
+                        result = ?oc.result,
+                        reason = oc.reason.as_deref().unwrap_or("-"),
+                        "request not accepted"
+                    );
+                }
                 dispatch(&mut core, Event::ReqOutcome { coid: oc.coid, result: oc.result, reason: oc.reason }, &engine, live, &mut out).await;
             }
             _ = tick.tick() => {
@@ -604,6 +615,9 @@ async fn run_actor(
                     dispatch(&mut core, Event::Control(ControlCmd::Flatten), &engine, live, &mut out).await;
                 }
             }
+            _ = sweep.tick() => {
+                sweep_open_orders(&engine, &mut core, live).await;
+            }
         }
     }
     publish_snap(&engine, &core);
@@ -626,7 +640,6 @@ async fn dispatch(
                 if live =>
             {
                 if let Some(tx) = engine.trade.get(&core.cfg.market.maker_venue) {
-                    persist_action(engine, &core.cfg.id, &a).await;
                     let _ = tx.send(a);
                 }
             }
@@ -647,6 +660,56 @@ async fn dispatch(
         }
     }
     publish_snap(engine, core);
+}
+
+/// Compare the venue's open orders against the slot map and cancel anything unreachable:
+/// orders left by another strategy, and our own orders that no slot points at any more
+/// (a rejected request, a missed exec push, or a previous process can all leave those behind).
+async fn sweep_open_orders(engine: &Arc<Engine>, core: &mut StrategyCore, live: bool) {
+    let venue = core.cfg.market.maker_venue;
+    let symbol = core.cfg.market.maker_symbol.clone();
+    let Some(api) = engine.apis.get(&venue) else {
+        return;
+    };
+    let open = match api.open_orders(&symbol).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(strategy = %core.cfg.id, error = %e, "open order sweep failed");
+            return;
+        }
+    };
+    let mut foreign = Vec::new();
+    let mut mine = Vec::new();
+    for o in open {
+        if o.coid.strategy_prefix() == Some(core.cfg.id.as_str()) {
+            mine.push(o.coid);
+        } else {
+            foreign.push(o.coid);
+        }
+    }
+    let orphans = core.reconcile_open_orders(&mine);
+    if orphans.is_empty() && foreign.is_empty() {
+        return;
+    }
+    warn!(
+        strategy = %core.cfg.id,
+        orphans = orphans.len(),
+        foreign = foreign.len(),
+        "cancelling untracked open orders"
+    );
+    if !live {
+        return;
+    }
+    let Some(tx) = engine.trade.get(&venue) else {
+        return;
+    };
+    for coid in orphans.into_iter().chain(foreign) {
+        let _ = tx.send(Action::Cancel {
+            coid,
+            venue,
+            symbol: symbol.clone(),
+        });
+    }
 }
 
 fn apply_venue_links(core: &mut StrategyCore, engine: &Engine) {
@@ -670,72 +733,64 @@ fn publish_snap(engine: &Engine, core: &StrategyCore) {
     let _ = engine.ws.send(WsMsg::Snapshot { snapshot: snap });
 }
 
-async fn persist_action(engine: &Engine, sid: &StrategyId, action: &Action) {
-    if let Action::Place(req) = action {
-        let rec = OrderRecord {
-            coid: req.coid.clone(),
-            strategy_id: sid.as_str().into(),
-            venue: req.venue,
-            symbol: req.symbol.clone(),
-            side: req.side,
-            purpose: if req.reduce_only { "exit" } else { "grid" }.into(),
-            px: req.px,
-            qty: req.qty,
-            filled_qty: Qty::default(),
-            status: "pending".into(),
-            exchange_id: None,
-            reduce_only: req.reduce_only,
-            created_at: Ts::now_system(),
-            updated_at: Ts::now_system(),
-        };
-        let _ = engine.store.upsert_order(&rec).await;
+/// Venues report cumulative `filled_qty` reliably but per-event `last_qty` only sometimes
+/// (Gate's `futures.orders` push has no such field). Tracking the cumulative value per
+/// order lets us derive the increment ourselves, which is also idempotent if a venue
+/// repeats a push.
+#[derive(Default)]
+struct FillTracker {
+    filled: HashMap<crate::types::ClientOrderId, Qty>,
+}
+
+impl FillTracker {
+    fn increment(&mut self, exec: &crate::types::ExecReport) -> Qty {
+        use crate::types::ExecKind;
+        let prev = self
+            .filled
+            .get(&exec.coid)
+            .copied()
+            .unwrap_or_default();
+        let delta = Qty(exec.filled_qty.0 - prev.0);
+        if matches!(
+            exec.kind,
+            ExecKind::Fill
+                | ExecKind::Canceled
+                | ExecKind::Expired
+                | ExecKind::Reject
+                | ExecKind::AmendReject
+        ) {
+            self.filled.remove(&exec.coid);
+        } else if delta.is_positive() {
+            self.filled.insert(exec.coid.clone(), exec.filled_qty);
+        }
+        if delta.is_positive() {
+            delta
+        } else {
+            Qty::default()
+        }
     }
 }
 
-async fn persist_exec(engine: &Engine, sid: &StrategyId, exec: &crate::types::ExecReport) {
-    let status = match exec.kind {
-        crate::types::ExecKind::Ack => "live",
-        crate::types::ExecKind::PartialFill => "partial",
-        crate::types::ExecKind::Fill => "filled",
-        crate::types::ExecKind::Canceled => "canceled",
-        crate::types::ExecKind::Expired => "expired",
-        crate::types::ExecKind::Reject | crate::types::ExecKind::AmendReject => "rejected",
-        crate::types::ExecKind::AmendAck => "live",
+async fn persist_fill(engine: &Engine, sid: &StrategyId, exec: &crate::types::ExecReport) {
+    let (Some(px), Some(qty)) = (exec.last_px, exec.last_qty) else {
+        return;
     };
-    if let Some(px) = exec.px {
-        let rec = OrderRecord {
-            coid: exec.coid.clone(),
-            strategy_id: sid.as_str().into(),
-            venue: exec.venue,
-            symbol: exec.symbol.clone(),
-            side: exec.side,
-            purpose: String::new(),
-            px,
-            qty: exec.qty.unwrap_or_default(),
-            filled_qty: exec.filled_qty,
-            status: status.into(),
-            exchange_id: exec.exchange_id.clone(),
-            reduce_only: false,
-            created_at: exec.ts,
-            updated_at: exec.ts,
-        };
-        let _ = engine.store.upsert_order(&rec).await;
+    if !qty.is_positive() || !px.is_positive() {
+        return;
     }
-    if let (Some(px), Some(qty)) = (exec.last_px, exec.last_qty) {
-        if qty.is_positive() {
-            let fill = FillRecord {
-                id: 0,
-                strategy_id: sid.as_str().into(),
-                coid: exec.coid.clone(),
-                venue: exec.venue,
-                symbol: exec.symbol.clone(),
-                side: exec.side,
-                px,
-                qty,
-                fee: None,
-                ts: exec.ts,
-            };
-            let _ = engine.store.insert_fill(&fill).await;
-        }
+    let fill = FillRecord {
+        id: 0,
+        strategy_id: sid.as_str().into(),
+        coid: exec.coid.clone(),
+        venue: exec.venue,
+        symbol: exec.symbol.clone(),
+        side: exec.side,
+        px,
+        qty,
+        fee: None,
+        ts: exec.ts,
+    };
+    if let Err(e) = engine.store.insert_fill(&fill).await {
+        warn!(strategy = %sid, error = %e, "persist fill failed");
     }
 }

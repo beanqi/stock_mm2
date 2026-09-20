@@ -148,6 +148,9 @@ pub fn reconcile(
     for d in desired {
         let slot = state.slot(d.key);
         slot.desired = Some(d.order.clone());
+        if slot.is_blocked(now) {
+            continue;
+        }
         match slot.state {
             SlotStateKind::Empty => {
                 let seq = state.alloc_seq();
@@ -168,6 +171,7 @@ pub fn reconcile(
                 if supports_amend {
                     slot.state = SlotStateKind::PendingAmend;
                     slot.pending_since = Some(now);
+                    slot.amend_from = Some((live.px, live.qty));
                     if let Some(l) = slot.live.as_mut() {
                         l.px = d.order.px;
                         l.qty = d.order.qty;
@@ -232,6 +236,7 @@ fn place(
     let slot = state.slot(key);
     slot.state = SlotStateKind::PendingNew;
     slot.pending_since = Some(now);
+    slot.amend_from = None;
     slot.live = Some(crate::types::LiveOrder {
         coid: coid.clone(),
         exchange_id: None,
