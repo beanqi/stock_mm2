@@ -2,5 +2,43 @@
 name = "stock_mm"
 version = "0.1.0"
 edition = "2024"
+default-run = "stock-mm"
+
+[lib]
+name = "stock_mm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stock-mm"
+path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+parking_lot = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1"

@@ -1,0 +1,13 @@
+listen = "127.0.0.1:8080"
+
+recommended_underlyings = [
+  "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
+  "GOOGL", "META", "NFLX", "AMD", "BABA",
+  "COIN", "MSTR", "PLTR", "AVGO", "INTC",
+  "CRM", "ORCL", "QCOM", "HOOD", "SMCI",
+]
+
+[global_risk]
+max_notional = "50000"
+max_notional_per_venue = "30000"
+max_daily_loss = "1000"
