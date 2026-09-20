@@ -240,7 +240,7 @@ async fn get_strategy(State(st): State<AppState>, Path(id): Path<String>) -> Res
 
 async fn create_strategy(State(st): State<AppState>, Json(cfg): Json<StrategyConfig>) -> Response {
     match st.engine.upsert_strategy(cfg).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
+        Ok(()) => created_ok(),
         Err(e) => err(e),
     }
 }
@@ -252,7 +252,7 @@ async fn update_strategy(
 ) -> Response {
     cfg.id = StrategyId::new(id);
     match st.engine.upsert_strategy(cfg).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => ok_json(),
         Err(e) => err(e),
     }
 }
@@ -267,19 +267,19 @@ async fn delete_strategy(State(st): State<AppState>, Path(id): Path<String>) -> 
 
 async fn start_strategy(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     match st.engine.start_strategy(&StrategyId::new(id)).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => ok_json(),
         Err(e) => err(e),
     }
 }
 
 async fn stop_strategy(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     st.engine.stop_strategy(&StrategyId::new(id)).await;
-    StatusCode::OK.into_response()
+    ok_json()
 }
 
 async fn flatten_strategy(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     st.engine.flatten_strategy(&StrategyId::new(id)).await;
-    StatusCode::OK.into_response()
+    ok_json()
 }
 
 #[derive(Deserialize)]
@@ -343,12 +343,12 @@ async fn risk_view(State(st): State<AppState>) -> impl IntoResponse {
 
 async fn kill(State(st): State<AppState>) -> impl IntoResponse {
     st.engine.kill_all().await;
-    StatusCode::OK
+    ok_json()
 }
 
 async fn resume(State(st): State<AppState>) -> impl IntoResponse {
     st.engine.clear_kill().await;
-    StatusCode::OK
+    ok_json()
 }
 
 async fn ws_upgrade(State(st): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -387,6 +387,14 @@ async fn ws_loop(st: AppState, mut socket: WebSocket) {
 }
 
 use tokio::sync::broadcast;
+
+fn ok_json() -> Response {
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+fn created_ok() -> Response {
+    (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
+}
 
 fn err(e: impl std::fmt::Display) -> Response {
     (

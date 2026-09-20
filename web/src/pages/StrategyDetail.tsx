@@ -1,34 +1,46 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, fmtBps, fmtPx, type Snapshot, type StrategyConfig } from "../api";
+import { api, fmtBps, fmtPx, isRunning, lifeLabel, reasonLabel, type Snapshot, type StrategyConfig } from "../api";
 
 export default function StrategyDetail({ live }: { live: Record<string, Snapshot> }) {
   const { id = "" } = useParams();
   const [cfg, setCfg] = useState<StrategyConfig | null>(null);
+  const [rest, setRest] = useState<Snapshot | null>(null);
   const [err, setErr] = useState("");
 
-  useEffect(() => {
+  const load = () =>
     api
       .strategy(id)
-      .then((r) => setCfg(r.config))
+      .then((r) => {
+        setCfg(r.config);
+        setRest(r.snapshot || null);
+      })
       .catch((e) => setErr(String(e)));
+
+  useEffect(() => {
+    load();
   }, [id]);
 
-  const s = live[id];
+  const s = live[id] || rest;
+  const life = s?.lifecycle || "init";
+  const active = isRunning(life);
 
   return (
     <div>
       <div className="row">
         <h1 style={{ margin: 0 }}>{cfg?.name || id}</h1>
-        <span className={`badge ${s?.lifecycle || "init"}`}>{s?.lifecycle || "init"}</span>
+        <span className={`badge ${life}`}>{lifeLabel(life)}</span>
         <div className="spacer" />
         <Link to={`/strategies/${id}/edit`}>
           <button>编辑</button>
         </Link>
-        <button className="primary" onClick={() => api.start(id)}>
-          启动
-        </button>
-        <button onClick={() => api.stop(id)}>停止</button>
+        {active ? (
+          <button onClick={() => api.stop(id).then(load).catch((e) => setErr(String(e)))}>停止</button>
+        ) : (
+          <button className="primary" onClick={() => api.start(id).then(load).catch((e) => setErr(String(e)))}>
+            启动
+          </button>
+        )}
         <button onClick={() => api.flatten(id)}>全平</button>
       </div>
       {err && <div className="err">{err}</div>}
@@ -42,7 +54,7 @@ export default function StrategyDetail({ live }: { live: Record<string, Snapshot
           <div>
             Warmup {s?.warmup_samples ?? 0}/{s?.warmup_needed ?? 0}
           </div>
-          {s?.permission?.reason && <div className="reason">{s.permission.reason}</div>}
+          {s?.permission?.reason && <div className="reason">{reasonLabel(s.permission.reason)}</div>}
         </div>
         <div className="card">
           <h3>链路</h3>

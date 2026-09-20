@@ -101,7 +101,15 @@ function Shell() {
             return (
               <span key={v}>
                 <i className={`dot ${h?.md ? "on" : "off"}`} />
-                {v} 行情{h?.has_keys ? "" : " ·无Key"}
+                {v} 行情
+                {h?.has_keys ? (
+                  <>
+                    <i className={`dot ${h?.trading ? "on" : "off"}`} style={{ marginLeft: 8 }} />
+                    交易
+                  </>
+                ) : (
+                  " ·无Key"
+                )}
               </span>
             );
           })}

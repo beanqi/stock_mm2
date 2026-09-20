@@ -316,29 +316,54 @@ impl Engine {
             cfg.market.maker_symbol.clone(),
             cfg.market.ref_symbol.clone(),
         ]);
-        self.snapshots.write().insert(
-            cfg.id.as_str().to_string(),
-            idle_snapshot(&cfg, self.instrument_for(&cfg)),
-        );
-        Ok(())
+        let running = {
+            let actors = self.actors.lock().await;
+            actors.contains_key(cfg.id.as_str())
+        };
+        if !running {
+            self.snapshots.write().insert(
+                cfg.id.as_str().to_string(),
+                idle_snapshot(&cfg, self.instrument_for(&cfg)),
+            );
+        }
+        if cfg.enabled {
+            self.spawn_actor(cfg).await
+        } else {
+            self.stop_actor(&cfg.id).await;
+            Ok(())
+        }
     }
 
     pub async fn delete_strategy(&self, id: &StrategyId) -> Result<bool> {
-        self.stop_strategy(id).await;
+        self.stop_actor(id).await;
         self.snapshots.write().remove(id.as_str());
         self.store.delete_strategy(id).await
     }
 
     pub async fn start_strategy(self: &Arc<Self>, id: &StrategyId) -> Result<()> {
-        let cfg = self
+        let mut cfg = self
             .store
             .get_strategy(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("strategy not found"))?;
+        if !cfg.enabled {
+            cfg.enabled = true;
+            self.store.upsert_strategy(&cfg).await?;
+        }
         self.spawn_actor(cfg).await
     }
 
     pub async fn stop_strategy(&self, id: &StrategyId) {
+        self.stop_actor(id).await;
+        if let Ok(Some(mut cfg)) = self.store.get_strategy(id).await {
+            if cfg.enabled {
+                cfg.enabled = false;
+                let _ = self.store.upsert_strategy(&cfg).await;
+            }
+        }
+    }
+
+    async fn stop_actor(&self, id: &StrategyId) {
         let mut actors = self.actors.lock().await;
         if let Some(h) = actors.remove(id.as_str()) {
             let _ = h.ctrl.send(ControlCmd::Stop);
@@ -463,18 +488,8 @@ async fn run_actor(
     let live = cfg.mode == RunMode::Live && !engine.risk.is_killed();
 
     let mut core = StrategyCore::new(cfg.clone(), inst);
-    {
-        let health = engine.health.read();
-        if let Some(h) = health.get(&ref_venue) {
-            core.set_md_link(true, h.md);
-        }
-        if let Some(h) = health.get(&maker_venue) {
-            core.set_md_link(false, h.md);
-        }
-    }
     let mut out = Vec::new();
-    core.on_event(Ts::now_system(), &Event::Control(ControlCmd::Start), &mut out);
-    out.clear();
+    apply_venue_links(&mut core, &engine);
 
     if let Some(api) = engine.apis.get(&maker_venue) {
         if let Ok(pos) = api.positions().await {
@@ -501,6 +516,15 @@ async fn run_actor(
             }
         }
     }
+
+    dispatch(
+        &mut core,
+        Event::Control(ControlCmd::Start),
+        &engine,
+        live,
+        &mut out,
+    )
+    .await;
 
     let mut books_r = engine.books[&ref_venue].subscribe();
     let mut books_m = engine.books[&maker_venue].subscribe();
@@ -556,6 +580,7 @@ async fn run_actor(
                 dispatch(&mut core, Event::ReqOutcome { coid: oc.coid, result: oc.result, reason: oc.reason }, &engine, live, &mut out).await;
             }
             _ = tick.tick() => {
+                apply_venue_links(&mut core, &engine);
                 let ref_book = engine
                     .latest_books
                     .read()
@@ -622,6 +647,18 @@ async fn dispatch(
         }
     }
     publish_snap(engine, core);
+}
+
+fn apply_venue_links(core: &mut StrategyCore, engine: &Engine) {
+    let health = engine.health.read();
+    if let Some(h) = health.get(&core.cfg.market.ref_venue) {
+        core.set_md_link(true, h.md);
+    }
+    if let Some(h) = health.get(&core.cfg.market.maker_venue) {
+        core.set_md_link(false, h.md);
+        core.state.links.private = h.private;
+        core.state.links.trading = h.trading;
+    }
 }
 
 fn publish_snap(engine: &Engine, core: &StrategyCore) {

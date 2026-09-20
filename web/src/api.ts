@@ -199,15 +199,19 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let msg = res.statusText;
     try {
-      const j = await res.json();
-      msg = j.error || msg;
+      const text = await res.text();
+      if (text) {
+        const j = JSON.parse(text);
+        msg = j.error || msg;
+      }
     } catch {
       /* ignore */
     }
     throw new Error(msg);
   }
-  if (res.status === 204) return undefined as T;
-  return res.json();
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export const api = {
@@ -261,4 +265,59 @@ export function fmtPx(x: string | number | null | undefined) {
   const n = typeof x === "number" ? x : Number(x);
   if (Number.isNaN(n)) return String(x);
   return n.toFixed(4);
+}
+
+export function isRunning(life?: string | null) {
+  return life === "warmup" || life === "running" || life === "degraded" || life === "flattening";
+}
+
+export function lifeLabel(life?: string | null) {
+  switch (life) {
+    case "warmup":
+      return "预热中";
+    case "running":
+      return "运行中";
+    case "degraded":
+      return "已启动·受限";
+    case "flattening":
+      return "平仓中";
+    case "stopped":
+      return "已停止";
+    case "init":
+    default:
+      return "未启动";
+  }
+}
+
+const REASONS: Record<string, string> = {
+  idle: "尚未点击启动",
+  init: "尚未点击启动",
+  stopped: "已停止",
+  warmup: "样本不足，正在预热",
+  trading_down: "交易链路未就绪",
+  private_down: "私有推送未就绪",
+  ref_md_down: "参考行情未就绪",
+  maker_md_down: "挂单行情未就绪",
+  no_ref_book: "还没有参考盘口",
+  no_maker_book: "还没有挂单盘口",
+  flatten: "正在全平",
+  instrument_halt: "合约已停牌",
+  unknown_slots: "订单状态未知，等待收敛",
+  jump_cooldown: "价格跳变冷却中",
+  ref_crossed: "参考盘口交叉",
+  ref_invalid: "参考盘口无效",
+  maker_crossed: "挂单盘口交叉",
+  maker_invalid: "挂单盘口无效",
+  ref_stale: "参考行情过期",
+  maker_stale: "挂单行情过期",
+  spread_regime_break: "价差异常",
+  spread_abs_break: "价差超过绝对阈值",
+  max_long: "多头已达上限",
+  max_short: "空头已达上限",
+  position_cap: "仓位已达上限",
+};
+
+export function reasonLabel(reason?: string | null) {
+  if (!reason) return "";
+  return REASONS[reason] || reason;
 }
