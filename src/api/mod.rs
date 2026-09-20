@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::extract::ws::{Message, WebSocket};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
+use crate::auth::{Auth, AuthError};
 use crate::config::StrategyConfig;
 use crate::engine::Engine;
 use crate::types::StrategyId;
@@ -17,18 +19,30 @@ use crate::types::StrategyId;
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Engine>,
+    pub auth: Arc<Auth>,
 }
 
 pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
     let listen = engine.cfg.listen.clone();
     let web_dir = engine.cfg.web_dir.clone();
-    let state = AppState { engine };
+    let auth = Arc::new(Auth::load(&engine.cfg.database_url)?);
+    let state = AppState { engine, auth };
 
-    let mut app = Router::new()
+    let public = Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/verify", post(auth_verify))
+        .route("/api/auth/logout", post(auth_logout));
+
+    let protected = Router::new()
+        .route("/api/auth/me", get(auth_me))
         .route("/api/venues", get(venues))
         .route("/api/instruments", get(instruments))
-        .route("/api/strategies", get(list_strategies).post(create_strategy))
+        .route(
+            "/api/strategies",
+            get(list_strategies).post(create_strategy),
+        )
         .route(
             "/api/strategies/{id}",
             get(get_strategy)
@@ -46,6 +60,10 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         .route("/api/risk/kill", post(kill))
         .route("/api/risk/resume", post(resume))
         .route("/ws", get(ws_upgrade))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let mut app = public
+        .merge(protected)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -74,6 +92,103 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
     tracing::info!(%listen, "api listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn require_auth(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if st.auth.session_ok(req.headers()) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response()
+    }
+}
+
+async fn auth_status(State(st): State<AppState>) -> impl IntoResponse {
+    Json(st.auth.status())
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+async fn auth_login(State(st): State<AppState>, Json(body): Json<LoginBody>) -> Response {
+    match st.auth.login(&body.username, &body.password) {
+        Ok(out) => Json(serde_json::json!({
+            "ticket": out.ticket,
+            "enroll": out.enroll,
+            "otpauth_url": out.otpauth_url,
+            "secret": out.secret,
+            "qr_svg": out.qr_svg,
+        }))
+        .into_response(),
+        Err(AuthError::Locked) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "尝试次数过多，请稍后再试"})),
+        )
+            .into_response(),
+        Err(AuthError::Disabled) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "未启用登录"})),
+        )
+            .into_response(),
+        Err(AuthError::Denied) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "用户名或密码不正确"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyBody {
+    ticket: String,
+    code: String,
+}
+
+async fn auth_verify(State(st): State<AppState>, Json(body): Json<VerifyBody>) -> Response {
+    match st.auth.verify(&body.ticket, &body.code) {
+        Ok(token) => {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = st.auth.session_cookie(&token).parse() {
+                headers.insert(header::SET_COOKIE, value);
+            }
+            (headers, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Err(AuthError::Locked) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "尝试次数过多，请稍后再试"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "验证码不正确或已过期"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_logout(State(st): State<AppState>) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = st.auth.logout_cookie().parse() {
+        headers.insert(header::SET_COOKIE, value);
+    }
+    (headers, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+async fn auth_me(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let username = st
+        .auth
+        .session_user(&headers)
+        .unwrap_or_else(|| st.auth.username.clone());
+    Json(serde_json::json!({
+        "username": username,
+        "enabled": st.auth.enabled,
+    }))
 }
 
 async fn health(State(st): State<AppState>) -> impl IntoResponse {
@@ -178,7 +293,11 @@ async fn list_orders(State(st): State<AppState>, Query(q): Query<ListQuery>) -> 
     match st
         .engine
         .store
-        .list_orders(q.strategy_id.as_deref(), q.open.unwrap_or(false), q.limit.unwrap_or(200))
+        .list_orders(
+            q.strategy_id.as_deref(),
+            q.open.unwrap_or(false),
+            q.limit.unwrap_or(200),
+        )
         .await
     {
         Ok(v) => Json(v).into_response(),

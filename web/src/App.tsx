@@ -1,17 +1,57 @@
-import { NavLink, Route, Routes } from "react-router-dom";
+import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { api, wsUrl, type RiskView, type Snapshot, type VenueHealth } from "./api";
+import Login from "./pages/Login";
 import Strategies from "./pages/Strategies";
 import StrategyForm from "./pages/StrategyForm";
 import StrategyDetail from "./pages/StrategyDetail";
 import Orders from "./pages/Orders";
 
 export default function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route path="*" element={<Shell />} />
+    </Routes>
+  );
+}
+
+function Shell() {
+  const [gate, setGate] = useState<"loading" | "ok" | "login">("loading");
+  const [user, setUser] = useState<string | null>(null);
   const [venues, setVenues] = useState<VenueHealth[]>([]);
   const [risk, setRisk] = useState<RiskView | null>(null);
   const [snaps, setSnaps] = useState<Record<string, Snapshot>>({});
 
   useEffect(() => {
+    let cancelled = false;
+    api
+      .authStatus()
+      .then(async (s) => {
+        if (!s.enabled) {
+          if (!cancelled) setGate("ok");
+          return;
+        }
+        try {
+          const me = await api.me();
+          if (!cancelled) {
+            setUser(me.username);
+            setGate("ok");
+          }
+        } catch {
+          if (!cancelled) setGate("login");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGate("ok");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (gate !== "ok") return;
     api.venues().then(setVenues).catch(() => {});
     api.risk().then(setRisk).catch(() => {});
     const ws = new WebSocket(wsUrl());
@@ -37,7 +77,10 @@ export default function App() {
       }
     };
     return () => ws.close();
-  }, []);
+  }, [gate]);
+
+  if (gate === "loading") return null;
+  if (gate === "login") return <Navigate to="/login" replace />;
 
   return (
     <div className="app">
@@ -71,6 +114,15 @@ export default function App() {
         ) : (
           <button className="danger" onClick={() => api.kill().then(() => api.risk().then(setRisk))}>
             Kill Switch
+          </button>
+        )}
+        {user && <span className="who">{user}</span>}
+        {user && (
+          <button
+            className="ghost"
+            onClick={() => api.logout().finally(() => location.assign("/login"))}
+          >
+            退出
           </button>
         )}
       </header>

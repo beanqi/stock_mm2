@@ -169,11 +169,33 @@ export function defaultConfig(id = "demo"): StrategyConfig {
   };
 }
 
+export interface AuthStatus {
+  enabled: boolean;
+  enrolled: boolean;
+}
+
+export interface LoginChallenge {
+  ticket: string;
+  enroll: boolean;
+  otpauth_url?: string | null;
+  secret?: string | null;
+  qr_svg?: string | null;
+}
+
+export interface AuthMe {
+  username: string;
+  enabled: boolean;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     ...init,
   });
+  if (res.status === 401 && !path.startsWith("/api/auth/") && location.pathname !== "/login") {
+    location.assign("/login");
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try {
@@ -189,6 +211,19 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authStatus: () => req<AuthStatus>("/api/auth/status"),
+  login: (username: string, password: string) =>
+    req<LoginChallenge>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  verify: (ticket: string, code: string) =>
+    req<{ ok: boolean }>("/api/auth/verify", {
+      method: "POST",
+      body: JSON.stringify({ ticket, code }),
+    }),
+  me: () => req<AuthMe>("/api/auth/me"),
+  logout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   strategies: () => req<StrategyRow[]>("/api/strategies"),
   strategy: (id: string) => req<{ config: StrategyConfig; snapshot?: Snapshot }>("/api/strategies/" + id),
   save: (cfg: StrategyConfig, update = false) =>
