@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod gate;
+pub mod gate_trade;
 pub mod rest;
 pub mod session;
 

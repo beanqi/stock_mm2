@@ -14,6 +14,7 @@ use crate::types::{
 };
 
 use super::rest::{get_json, hmac_sha512_hex, http_client, send_signed, sha512_hex};
+use super::gate_trade::GateTradePool;
 use super::session::{now_secs, parse_dec, spawn_text_ws};
 use super::{PrivateMsg, ReqOutcome, VenueApi, VenueEndpoints, endpoints, native_symbol};
 
@@ -186,15 +187,29 @@ impl GateVenue {
     ) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let _ = link.send(this.has_keys());
+            if !this.has_keys() {
+                let _ = link.send(false);
+                return;
+            }
+            let key = this.key.clone().expect("gate key");
+            let secret = this.secret.clone().expect("gate secret");
+            let pool = GateTradePool::spawn(this.ep.trade_ws.clone(), key, secret, link).await;
             while let Some(action) = trade_rx.recv().await {
                 match action {
                     Action::Place(req) => {
-                        let r = this.place(&req).await;
+                        let r = if pool.any_ready() {
+                            pool.place(&req).await
+                        } else {
+                            this.place(&req).await
+                        };
                         let _ = outcomes.send(map_result(req.coid, r));
                     }
                     Action::Cancel { coid, symbol, .. } => {
-                        let r = this.cancel(&symbol, &coid).await;
+                        let r = if pool.any_ready() {
+                            pool.cancel(&symbol, &coid).await
+                        } else {
+                            this.cancel(&symbol, &coid).await
+                        };
                         let _ = outcomes.send(map_result(coid, r));
                     }
                     Action::Amend {
@@ -204,11 +219,20 @@ impl GateVenue {
                         qty,
                         ..
                     } => {
-                        let r = this.amend(&symbol, &coid, px, qty).await;
+                        let r = if pool.any_ready() {
+                            pool.amend(&symbol, &coid, px, qty).await
+                        } else {
+                            this.amend(&symbol, &coid, px, qty).await
+                        };
                         let _ = outcomes.send(map_result(coid, r));
                     }
                     Action::CancelAll { symbol, .. } => {
-                        if let Err(e) = this.cancel_all(&symbol).await {
+                        let r = if pool.any_ready() {
+                            pool.cancel_all(&symbol).await
+                        } else {
+                            this.cancel_all(&symbol).await
+                        };
+                        if let Err(e) = r {
                             tracing::warn!(error = %e, "gate cancel all");
                         }
                     }
